@@ -31,7 +31,7 @@ export function helixToWebPath(helixPath) {
   );
   if (norm === '/index' || norm.endsWith('/index')) {
     const parent = norm === '/index' ? '' : norm.slice(0, -'/index'.length);
-    return parent ? parent : '/';
+    return parent || '/';
   }
   return norm;
 }
@@ -58,7 +58,7 @@ export function displayFolderPath(path) {
 }
 
 /**
- * DA may pass the app route (tools/content-deployment-hub) as context.path — not content.
+ * DA may pass the app route (tools/content-operations-hub) as context.path — not content.
  * @param {string} path
  * @returns {boolean}
  */
@@ -66,9 +66,7 @@ export function isAppRoutePath(path) {
   const normalized = normalizeFolderPath(path);
   if (!normalized) return false;
   if (normalized === 'tools' || normalized.startsWith('tools/')) return true;
-  if (!normalized.startsWith('tools')) return false;
-  return normalized.includes('content-deployment-hub')
-    || normalized.includes('bulk-preview-publish');
+  return normalized.includes('content-operations-hub') && normalized.startsWith('tools');
 }
 
 /**

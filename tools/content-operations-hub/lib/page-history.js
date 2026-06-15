@@ -36,19 +36,36 @@ function historyMapFrom(platformStatus, pageList) {
 /**
  * @param {HistoryMap} statusMap
  * @param {{ helixPath: string }[]} pageList
- * @returns {{ preview: number, live: number, none: number }}
+ * @returns {{
+ *   preview: number,
+ *   live: number,
+ *   none: number,
+ *   previewed: number,
+ *   orphanedLive: number,
+ * }}
  */
 export function countStatusBreakdown(statusMap, pageList) {
   let preview = 0;
   let live = 0;
   let none = 0;
+  let previewed = 0;
+  let orphanedLive = 0;
   pageList.forEach((p) => {
     const e = statusMap[p.helixPath];
-    if (e?.publishedAt) live += 1;
-    else if (e?.previewedAt) preview += 1;
-    else none += 1;
+    if (e?.publishedAt) {
+      live += 1;
+      if (e.previewedAt) previewed += 1;
+      else orphanedLive += 1;
+    } else if (e?.previewedAt) {
+      preview += 1;
+      previewed += 1;
+    } else {
+      none += 1;
+    }
   });
-  return { preview, live, none };
+  return {
+    preview, live, none, previewed, orphanedLive,
+  };
 }
 
 /**
@@ -56,18 +73,22 @@ export function countStatusBreakdown(statusMap, pageList) {
  * @param {{ helixPath: string }[]} pageList
  */
 export function formatDeploymentSummary(platformStatus, pageList) {
-  const { live, preview, none } = countStatusBreakdown(
+  const {
+    live, preview, none, previewed, orphanedLive,
+  } = countStatusBreakdown(
     historyMapFrom(platformStatus, pageList),
     pageList,
   );
-  return `${live} live · ${preview} preview only · ${none} not deployed (${pageList.length} total)`;
+  return `${live} live · ${orphanedLive} orphaned live · ${previewed} previewed · ${preview} preview only · ${none} not deployed (${pageList.length} total)`;
 }
 
 /** @type {ReadonlyArray<[string, string]>} */
 export const PAGE_FILTERS = [
   ['all', 'All pages'],
-  ['never-previewed', 'Never previewed'],
-  ['never-published', 'Never published'],
+  ['never-previewed', 'Not previewed'],
+  ['never-published', 'Not published'],
+  ['preview-only', 'Preview only'],
+  ['orphaned-live', 'Orphaned live'],
   ['recent-preview', 'Recently previewed'],
   ['recent-publish', 'Recently published'],
   ['oldest-preview', 'Oldest previewed'],
@@ -89,19 +110,40 @@ const DATE_SORT_FILTERS = new Set([
  * @param {number} [minLen]
  * @returns {{ helixPath: string, name?: string }[]}
  */
-export function filterPagesBySearch(pages, query, browseFolder = '', minLen = 3) {
-  const q = String(query || '').trim().toLowerCase();
+export function filterPagesBySearch(
+  pages,
+  query,
+  browseFolder = '',
+  minLen = 3,
+) {
+  const q = String(query || '')
+    .trim()
+    .toLowerCase();
   if (!q) return pages;
   if (q.length < minLen) return pages;
   return pages.filter((page) => {
     const name = String(page.name || '').toLowerCase();
-    const path = pageListRelativePath(page.helixPath, browseFolder).toLowerCase();
-    const { title } = formatPageListLabel(page.helixPath, page.name, browseFolder);
-    return name.includes(q) || path.includes(q) || title.toLowerCase().includes(q);
+    const path = pageListRelativePath(
+      page.helixPath,
+      browseFolder,
+    ).toLowerCase();
+    const { title } = formatPageListLabel(
+      page.helixPath,
+      page.name,
+      browseFolder,
+    );
+    return (
+      name.includes(q) || path.includes(q) || title.toLowerCase().includes(q)
+    );
   });
 }
 
-export function filterAndSortPages(pages, history, filterId, browseFolder = '') {
+export function filterAndSortPages(
+  pages,
+  history,
+  filterId,
+  browseFolder = '',
+) {
   if (filterId === 'all') return sortPagesByListPath(pages, browseFolder);
 
   const withMeta = pages.map((page) => ({
@@ -119,21 +161,35 @@ export function filterAndSortPages(pages, history, filterId, browseFolder = '') 
     case 'never-published':
       filtered = withMeta.filter((m) => !m.entry.publishedAt);
       break;
+    case 'preview-only':
+      filtered = withMeta.filter((m) => m.entry.previewedAt && !m.entry.publishedAt);
+      break;
+    case 'orphaned-live':
+      filtered = withMeta.filter((m) => m.entry.publishedAt && !m.entry.previewedAt);
+      break;
     case 'recent-preview':
       filtered = withMeta.filter((m) => m.entry.previewedAt);
-      filtered.sort((a, b) => (b.entry.previewedAt || 0) - (a.entry.previewedAt || 0));
+      filtered.sort(
+        (a, b) => (b.entry.previewedAt || 0) - (a.entry.previewedAt || 0),
+      );
       break;
     case 'recent-publish':
       filtered = withMeta.filter((m) => m.entry.publishedAt);
-      filtered.sort((a, b) => (b.entry.publishedAt || 0) - (a.entry.publishedAt || 0));
+      filtered.sort(
+        (a, b) => (b.entry.publishedAt || 0) - (a.entry.publishedAt || 0),
+      );
       break;
     case 'oldest-preview':
       filtered = withMeta.filter((m) => m.entry.previewedAt);
-      filtered.sort((a, b) => (a.entry.previewedAt || 0) - (b.entry.previewedAt || 0));
+      filtered.sort(
+        (a, b) => (a.entry.previewedAt || 0) - (b.entry.previewedAt || 0),
+      );
       break;
     case 'oldest-publish':
       filtered = withMeta.filter((m) => m.entry.publishedAt);
-      filtered.sort((a, b) => (a.entry.publishedAt || 0) - (b.entry.publishedAt || 0));
+      filtered.sort(
+        (a, b) => (a.entry.publishedAt || 0) - (b.entry.publishedAt || 0),
+      );
       break;
     default:
       return sortPagesByListPath(pages, browseFolder);

@@ -6,19 +6,9 @@ import { resolveContentFolderPath } from './paths.js';
 
 /** @typedef {{ kind: 'folder', name: string, folderPath: string }} FolderEntry */
 /** @typedef {{ kind: 'document', helixPath: string, sourcePath: string, name: string }} DocumentEntry */
+/** @typedef {'preview'|'live'|'unpreview'|'unpublish'|'delete'|'open-da'|'open-preview'|'open-live'} PageOperationId */
 
 export const SEARCH_MIN_LEN = 3;
-
-/**
- * @typedef {{
- *   topic: 'preview' | 'live',
- *   paths: string[],
- *   urls: string[],
- *   host: string,
- *   title: string,
- *   completedAt: number,
- * }} LastOperation
- */
 
 /**
  * @param {{ org: string, site: string, ref: string }} ctx
@@ -33,31 +23,43 @@ export function createAppState(ctx) {
     pageScope: 'folder',
     loading: false,
     contentLoading: false,
+    /** True after the first successful content list load in this session. */
+    initialContentLoaded: false,
+    /** True until the workspace is shown for the first time this session. */
+    firstSessionLoad: true,
+    /** True while the first-session status fetch runs without locking the UI. */
+    statusFetchBackground: false,
+    /** False until the first deployment status fetch in this session has finished. */
+    hasCompletedInitialStatusFetch: false,
     error: null,
     status: null,
     statusType: 'info',
     jobDetail: null,
-    activeTab: 'pages',
     pageFilter: 'all',
     pageSearch: '',
     folderSearch: '',
-    /** When false, Fetch loads pages/folders only — no AEM status API calls. */
-    fetchStatus: false,
     /** True after a successful status check for the current page set. */
     statusFetched: false,
     platformStatus: {},
     statusCheckFailed: false,
     statusError: null,
     statusChecking: false,
+    /** True while silently refreshing cached deployment status from the API. */
+    statusRevalidating: false,
     statusCancelled: false,
     statusProgressDone: 0,
     statusProgressTotal: 0,
     /** @type {number | null} */
+    statusFetchedAt: null,
+    statusFetchedFromCache: false,
+    /** @type {number | null} */
     statusFetchStartedAt: null,
-    /** @type {LastOperation | null} */
-    lastOperation: null,
+    /** @type {string | null} */
+    statusPanelNote: null,
     /** @type {AbortController | null} */
     statusAbort: null,
+    /** @type {AbortController | null} */
+    statusRevalidateAbort: null,
     /** @type {AbortController | null} */
     jobAbort: null,
     /** @type {number | null} */
@@ -84,29 +86,34 @@ export function resetWorkspace(state) {
   state.pageScope = 'folder';
   state.loading = false;
   state.contentLoading = false;
+  state.initialContentLoaded = false;
+  state.firstSessionLoad = true;
+  state.statusFetchBackground = false;
+  state.hasCompletedInitialStatusFetch = false;
   state.error = null;
   state.status = null;
   state.statusType = 'info';
   state.jobDetail = null;
-  state.activeTab = 'pages';
   state.pageFilter = 'all';
   state.pageSearch = '';
   state.folderSearch = '';
-  state.fetchStatus = false;
   state.statusFetched = false;
   state.platformStatus = {};
   state.statusCheckFailed = false;
   state.statusError = null;
   state.statusChecking = false;
+  state.statusRevalidating = false;
   state.statusCancelled = false;
   state.statusProgressDone = 0;
   state.statusProgressTotal = 0;
+  state.statusFetchedAt = null;
+  state.statusFetchedFromCache = false;
   state.statusFetchStartedAt = null;
+  state.statusPanelNote = null;
   state.jobStartedAt = null;
   state.jobProgressProcessed = 0;
   state.jobProgressTotal = 0;
   state.jobTopic = null;
-  state.lastOperation = null;
   state.folders = [];
   state.pages = [];
   state.selected.clear();
@@ -133,15 +140,28 @@ export function cancelBulkJob(state, setMessage = true) {
 
 /**
  * @param {ReturnType<typeof createAppState>} state
+ */
+export function cancelStatusRevalidate(state) {
+  if (state.statusRevalidateAbort) {
+    state.statusRevalidateAbort.abort();
+    state.statusRevalidateAbort = null;
+  }
+  state.statusRevalidating = false;
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
  * @param {boolean} [setMessage]
  */
 export function cancelStatusCheck(state, setMessage = true) {
+  cancelStatusRevalidate(state);
   if (state.statusAbort) {
     state.statusAbort.abort();
     state.statusAbort = null;
   }
   if (!state.statusChecking) return;
   state.statusChecking = false;
+  state.statusFetchBackground = false;
   state.statusFetchStartedAt = null;
   if (setMessage) {
     const checked = state.statusProgressDone;
@@ -152,6 +172,25 @@ export function cancelStatusCheck(state, setMessage = true) {
       : 'Status check cancelled before any pages were checked';
     state.statusType = 'info';
   }
+}
+
+/**
+ * Resets page scope and the preview/publish checkbox (e.g. when opening another folder).
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function resetPagesViewState(state) {
+  state.pageScope = 'folder';
+}
+
+/**
+ * Clears selection, filters, search, and the preview/publish checkbox after a page operation starts.
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function clearPageWorkspaceAfterOperation(state) {
+  state.selected.clear();
+  state.pageFilter = 'all';
+  state.pageSearch = '';
+  state.folderSearch = '';
 }
 
 /**
@@ -168,11 +207,60 @@ export function buildStatusMap(state) {
 }
 
 /**
+ * Status fetch blocks interactions (selection, filters, DA links) when foreground.
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function isStatusFetchBlocking(state) {
+  return state.statusChecking && !state.statusFetched && !state.statusFetchBackground;
+}
+
+/**
+ * Status fetch blurs the workspace and shows the inline progress bar when foreground.
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function isStatusFetchLockingUi(state) {
+  return state.statusChecking && state.statusProgressTotal > 0 && !state.statusFetchBackground;
+}
+
+/**
  * @param {ReturnType<typeof createAppState>} state
  */
 export function isStatusLoaded(state) {
-  if (state.statusCheckFailed || state.statusChecking) return false;
+  if (state.statusCheckFailed) return false;
   return Boolean(state.statusFetched && state.pages.length > 0);
+}
+
+/**
+ * Deployment status is still loading for the current page set (no trustworthy dots/counts yet).
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function isDeploymentStatusPending(state) {
+  return state.pages.length > 0 && state.statusChecking && !state.statusFetched;
+}
+
+/**
+ * First session: centered loader until the first deployment status fetch completes.
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function isFirstSessionStatusPending(state) {
+  if (state.hasCompletedInitialStatusFetch || state.pages.length === 0) return false;
+  return !state.statusFetched;
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function markInitialStatusFetchComplete(state) {
+  state.hasCompletedInitialStatusFetch = true;
+  state.firstSessionLoad = false;
+  state.contentLoading = false;
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
+ */
+export function shouldShowPageStatus(state) {
+  return isStatusLoaded(state);
 }
 
 /**
@@ -181,10 +269,11 @@ export function isStatusLoaded(state) {
 export function getVisiblePages(state) {
   const statusMap = buildStatusMap(state);
   const browseFolder = resolveContentFolderPath(state.folderPath);
+  const filterId = String(state.pageFilter || 'all');
   let visible = filterAndSortPages(
     state.pages,
     statusMap,
-    String(state.pageFilter || 'all'),
+    filterId,
     browseFolder,
   );
   visible = /** @type {DocumentEntry[]} */ (filterPagesBySearch(
@@ -256,18 +345,7 @@ export function selectAllVisible(state, checked) {
  * @param {ReturnType<typeof createAppState>} state
  */
 export function formatSelectionPillText(state) {
-  const { visible } = getVisiblePages(state);
   const activeCount = getActiveSelectionCount(state);
-  const visibleCount = visible.length;
   const totalCount = state.pages.length;
-  if (activeCount === 0) {
-    return visibleCount === totalCount
-      ? `No pages selected · ${totalCount} in list`
-      : `No pages selected · ${visibleCount} shown (${totalCount} total)`;
-  }
-  if (visibleCount === totalCount) {
-    return `${activeCount} of ${totalCount} selected`;
-  }
-  const visibleSelected = visible.filter((p) => state.selected.has(p.helixPath)).length;
-  return `${activeCount} selected · ${visibleSelected} of ${visibleCount} shown`;
+  return `${activeCount} selected out of ${totalCount}`;
 }

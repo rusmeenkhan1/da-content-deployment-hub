@@ -79,6 +79,174 @@ export function showConfirmModal(opts) {
 }
 
 /**
+ * @typedef {{ scope: 'folder'|'tree', withStatus: boolean }} FolderLoadChoice
+ */
+
+/**
+ * Ask how to open a folder before loading its pages.
+ * @param {string} folderLabel
+ * @returns {Promise<FolderLoadChoice | null>}
+ */
+export function promptFolderLoadMode(folderLabel) {
+  const location = folderLabel || 'Site root';
+  return new Promise((resolve) => {
+    /** @type {'folder'|'tree'} */
+    let selectedScope = 'folder';
+
+    const backdrop = el('div', 'bulk-pp-modal-backdrop');
+    backdrop.setAttribute('role', 'presentation');
+
+    const dialog = el('div', 'bulk-pp-modal bulk-pp-modal-choice');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'bulk-pp-modal-title');
+
+    const head = el('div', 'bulk-pp-modal-choice-head');
+    const titleBlock = el('div', 'bulk-pp-modal-choice-title-block');
+    titleBlock.append(
+      el('h2', 'bulk-pp-modal-title', 'Open folder'),
+      el('p', 'bulk-pp-modal-choice-path', location),
+    );
+    const closeBtn = el('button', 'bulk-pp-modal-close');
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', 'Close');
+    closeBtn.innerHTML = '<span aria-hidden="true">&times;</span>';
+    head.append(titleBlock, closeBtn);
+    head.id = 'bulk-pp-modal-title';
+
+    const content = el('div', 'bulk-pp-modal-body-wrap');
+
+    const scopeSegment = el('div', 'bulk-pp-modal-scope-segment');
+    scopeSegment.setAttribute('role', 'radiogroup');
+    scopeSegment.setAttribute('aria-label', 'Page scope');
+
+    /** @type {HTMLButtonElement[]} */
+    const segmentButtons = [];
+
+    /**
+     * @param {'folder'|'tree'} value
+     * @param {string} label
+     */
+    const makeSegmentButton = (value, label) => {
+      const btn = el('button', 'bulk-pp-modal-scope-segment-btn', label);
+      btn.type = 'button';
+      btn.setAttribute('role', 'radio');
+      btn.setAttribute('aria-checked', value === 'folder' ? 'true' : 'false');
+      if (value === 'folder') btn.classList.add('bulk-pp-modal-scope-segment-btn-active');
+      btn.addEventListener('click', () => {
+        selectedScope = value;
+        updateScopeUi();
+      });
+      segmentButtons.push(btn);
+      return btn;
+    };
+
+    scopeSegment.append(
+      makeSegmentButton('folder', 'This folder'),
+      makeSegmentButton('tree', 'All subdirectories'),
+    );
+
+    const scopeHint = el(
+      'p',
+      'bulk-pp-modal-scope-hint-line',
+      'Includes nested folders — may take longer.',
+    );
+    scopeHint.hidden = true;
+
+    content.append(scopeSegment, scopeHint);
+
+    const actions = el('div', 'bulk-pp-modal-choice-actions');
+
+    /**
+     * @param {string} title
+     * @param {boolean} withStatus
+     */
+    const makeActionButton = (title, withStatus) => {
+      const btn = el(
+        'button',
+        `bulk-pp-modal-choice-btn ${withStatus
+          ? 'bulk-pp-modal-choice-btn-primary'
+          : 'bulk-pp-modal-choice-btn-secondary'}`,
+      );
+      btn.type = 'button';
+      btn.append(
+        el('span', 'bulk-pp-modal-choice-btn-title', title),
+        el('span', 'bulk-pp-modal-choice-btn-scope', 'This folder only'),
+      );
+      return btn;
+    };
+
+    const listBtn = makeActionButton('List pages', false);
+    const listWithStatusBtn = makeActionButton('List pages with deployment status', true);
+    actions.append(listBtn, listWithStatusBtn);
+
+    dialog.append(head, content, actions);
+    backdrop.append(dialog);
+    document.body.append(backdrop);
+
+    const syncScopeSegment = () => {
+      segmentButtons.forEach((btn, index) => {
+        const value = index === 0 ? 'folder' : 'tree';
+        const active = selectedScope === value;
+        btn.classList.toggle('bulk-pp-modal-scope-segment-btn-active', active);
+        btn.setAttribute('aria-checked', active ? 'true' : 'false');
+      });
+    };
+
+    const updateScopeUi = () => {
+      const scopeText = selectedScope === 'tree'
+        ? 'Including all subfolders'
+        : 'This folder only';
+      scopeHint.hidden = selectedScope !== 'tree';
+      actions.querySelectorAll('.bulk-pp-modal-choice-btn-scope').forEach((node) => {
+        node.textContent = scopeText;
+      });
+      syncScopeSegment();
+    };
+
+    const close = (result) => {
+      backdrop.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+
+    const onKey = (e) => {
+      if (e.key === 'Escape') close(null);
+    };
+
+    closeBtn.addEventListener('click', () => close(null));
+    listBtn.addEventListener('click', () => close({ scope: selectedScope, withStatus: false }));
+    listWithStatusBtn.addEventListener('click', () => close({ scope: selectedScope, withStatus: true }));
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) close(null);
+    });
+    document.addEventListener('keydown', onKey);
+    updateScopeUi();
+    listBtn.focus();
+  });
+}
+
+/**
+ * @param {number} pageCount
+ * @param {'folder'|'tree'} scope
+ * @param {string} [etaHint]
+ * @returns {Promise<boolean>}
+ */
+export function confirmCheckDeploymentStatus(pageCount, scope, etaHint = '') {
+  const scopeLabel = scope === 'tree' ? 'all subdirectories' : 'this directory';
+  let body = `This will check preview and publish status for ${pageCount} page${pageCount === 1 ? '' : 's'} in ${scopeLabel}. Each page requires a request to AEM.`;
+  if (etaHint) body += ` Estimated time: ${etaHint}.`;
+  body += ' You can cancel the check at any time.';
+  return showConfirmModal({
+    title: 'Load deployment status?',
+    body,
+    confirmLabel: 'Load status',
+    cancelLabel: 'Cancel',
+    variant: 'warning',
+  });
+}
+
+/**
  * @returns {Promise<boolean>}
  */
 export function confirmTreeScopeFetch() {
@@ -113,14 +281,39 @@ export function confirmOpenUrlsInNewTabs(count) {
  * @param {number} count
  * @returns {Promise<boolean>}
  */
+export function confirmPreviewSelected(count) {
+  return showConfirmModal({
+    title: 'Preview selected pages?',
+    body: `You are about to preview ${count} selected page${count === 1 ? '' : 's'}.`,
+    confirmLabel: 'Preview selected',
+    cancelLabel: 'Cancel',
+    variant: 'warning',
+  });
+}
+
+/**
+ * @param {number} count
+ * @returns {Promise<boolean>}
+ */
 export function confirmPublishToLive(count) {
   return showConfirmModal({
     title: 'Publish to production?',
-    body: `You are about to publish ${count} page${count === 1 ? '' : 's'} to the live site (.aem.live). This updates production content.`,
+    body: `You are about to publish ${count} selected page${count === 1 ? '' : 's'}.`,
     confirmLabel: 'Publish to production',
     cancelLabel: 'Cancel',
     variant: 'warning',
   });
+}
+
+/**
+ * Confirm before starting a bulk preview or publish job.
+ * @param {'preview'|'live'} topic
+ * @param {number} count
+ * @returns {Promise<boolean>}
+ */
+export function confirmBulkRun(topic, count) {
+  if (topic === 'live') return confirmPublishToLive(count);
+  return confirmPreviewSelected(count);
 }
 
 /** @typedef {'unpreview' | 'unpublish' | 'delete'} DestructiveAction */
