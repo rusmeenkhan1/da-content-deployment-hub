@@ -1,7 +1,5 @@
 import {
-  formatSelectionPillText,
   getActiveSelectionCount,
-  getVisibleFolders,
   getVisiblePages,
   isStatusFetchBlocking,
   shouldShowPageStatus,
@@ -9,6 +7,7 @@ import {
 } from './state.js';
 import { isJobModalOpen } from './progress-modal.js';
 import { el } from './dom.js';
+import { patchFolderTree } from './folder-tree.js';
 
 /**
  * @param {HTMLElement} root
@@ -31,7 +30,7 @@ function syncPageRowDaLinks(root, state) {
       linkEl.classList.remove('bulk-pp-btn-open-da-disabled');
       linkEl.removeAttribute('aria-disabled');
       if (href) linkEl.href = href;
-      linkEl.title = 'Open this page in Document Authoring';
+      linkEl.title = 'Open this page in DA';
     }
   });
 }
@@ -52,7 +51,19 @@ function syncSelectionActionBar(root, state) {
   if (countEl) countEl.textContent = count === 1 ? '1 page selected' : `${count} pages selected`;
 
   const clearBtn = root.querySelector('#bulk-pp-selection-clear');
-  if (clearBtn instanceof HTMLButtonElement) clearBtn.disabled = blocked;
+  if (clearBtn instanceof HTMLButtonElement) {
+    clearBtn.disabled = count === 0;
+  }
+
+  const shareTip = root.querySelector('#bulk-pp-selection-share-tooltip');
+  const shareBtn = root.querySelector('#bulk-pp-selection-share');
+  const shareLabel = count === 1
+    ? 'Copy preview URL to clipboard'
+    : `Copy ${count} preview URLs to clipboard`;
+  if (shareTip) shareTip.textContent = shareLabel;
+  if (shareBtn instanceof HTMLButtonElement) {
+    shareBtn.setAttribute('aria-label', shareLabel);
+  }
 
   root.querySelectorAll('.bulk-pp-selection-strip-btn, .bulk-pp-selection-more-item').forEach((btnEl) => {
     if (btnEl instanceof HTMLButtonElement) btnEl.disabled = blocked;
@@ -99,6 +110,9 @@ export function searchHintText(draft) {
   if (q.length >= SEARCH_MIN_LEN) {
     return `Filtering by “${q}”`;
   }
+  if (q.length > 0) {
+    return `Type at least ${SEARCH_MIN_LEN} characters to search`;
+  }
   return null;
 }
 
@@ -125,26 +139,6 @@ function syncSearchHint(hint, message) {
 export function syncSelectionUI(root, state) {
   const { visible: visiblePages } = getVisiblePages(state);
   const activeCount = getActiveSelectionCount(state);
-  const listBusy = visiblePages.length === 0 || isStatusFetchBlocking(state);
-
-  const pill = root.querySelector('#bulk-pp-selection-pill');
-  if (pill) {
-    pill.textContent = formatSelectionPillText(state);
-    pill.classList.toggle('bulk-pp-selection-pill-active', activeCount > 0);
-    pill.classList.toggle('bulk-pp-selection-pill-idle', activeCount === 0);
-  }
-
-  const selectionRow = root.querySelector('.bulk-pp-pages-selection-row');
-  if (selectionRow instanceof HTMLElement) {
-    selectionRow.classList.toggle(
-      'bulk-pp-pages-selection-row-active',
-      activeCount > 0,
-    );
-    selectionRow.classList.toggle(
-      'bulk-pp-pages-selection-row-idle',
-      activeCount === 0,
-    );
-  }
 
   root.querySelectorAll('.bulk-pp-page-cb').forEach((cb) => {
     if (!(cb instanceof HTMLInputElement)) return;
@@ -152,11 +146,10 @@ export function syncSelectionUI(root, state) {
     cb.checked = state.selected.has(path);
   });
 
-  const selectAllBtn = root.querySelector('#bulk-pp-select-all');
-  const selectNoneBtn = root.querySelector('#bulk-pp-select-none');
-  if (selectAllBtn instanceof HTMLButtonElement) selectAllBtn.disabled = listBusy;
-  if (selectNoneBtn instanceof HTMLButtonElement) {
-    selectNoneBtn.disabled = listBusy || activeCount === 0;
+  const colheadCb = root.querySelector('#bulk-pp-select-all-colhead');
+  if (colheadCb instanceof HTMLInputElement) {
+    colheadCb.checked = visiblePages.length > 0 && activeCount === visiblePages.length;
+    colheadCb.indeterminate = activeCount > 0 && activeCount < visiblePages.length;
   }
 
   syncSelectionActionBar(root, state);
@@ -165,46 +158,47 @@ export function syncSelectionUI(root, state) {
 /**
  * @param {HTMLElement} root
  * @param {ReturnType<typeof import('./state.js').createAppState>} state
- * @param {(
- *   folder: { name: string, folderPath: string },
- *   onNavigate: (p: string) => void,
- *   locked: boolean,
- * ) => HTMLElement} buildFolderRow
  */
-export function patchFolderSearchResults(root, state, buildFolderRow) {
-  const visibleFolders = getVisibleFolders(state);
-  const draft = String(state.folderSearch || '').trim();
-  const tooShort = draft.length > 0 && draft.length < SEARCH_MIN_LEN;
-
-  const count = root.querySelector('#bulk-pp-folder-count');
-  if (count) {
-    count.textContent = draft && !tooShort
-      ? `${visibleFolders.length} of ${state.folders.length}`
-      : String(state.folders.length);
-  }
+export function patchFolderSearchResults(root, state) {
+  patchFolderTree(
+    root,
+    state,
+    (path) => state.onNavigate(path),
+    isStatusFetchBlocking(state),
+  );
 
   syncSearchHint(
     root.querySelector('#bulk-pp-folder-search-hint'),
     searchHintText(state.folderSearch),
   );
+}
 
-  const list = root.querySelector('#bulk-pp-folder-list');
-  if (!list) return;
-  list.replaceChildren();
-  if (visibleFolders.length === 0) {
-    const emptyMsg = draft
-      ? 'No folders match this search.'
-      : 'No folders in this location.';
-    list.append(el('li', 'bulk-pp-list-empty', emptyMsg));
-  } else {
-    visibleFolders.forEach((folder) => {
-      list.append(buildFolderRow(
-        folder,
-        (path) => state.onNavigate(path),
-        isStatusFetchBlocking(state),
-      ));
-    });
+/**
+ * @param {ReturnType<typeof import('./state.js').createAppState>} state
+ * @param {number} [visibleCount]
+ */
+export function pagesLocationMetaText(state, visibleCount) {
+  const total = state.pages.length;
+  if (total === 0) {
+    return state.pageScope === 'tree'
+      ? 'No pages in this folder or subfolders.'
+      : 'No pages in this folder.';
   }
+  const scopeSuffix = state.pageScope === 'tree'
+    ? ' in this folder and subfolders'
+    : ' in this folder';
+  const draft = String(state.pageSearch || '').trim();
+  const filtered = visibleCount != null && visibleCount !== total;
+  const filterActive = state.pageFilter && state.pageFilter !== 'all';
+  if (filtered || filterActive) {
+    const noun = visibleCount === 1 ? 'page' : 'pages';
+    if (draft.length >= SEARCH_MIN_LEN) {
+      return `Showing ${visibleCount} of ${total} ${noun} matching search${scopeSuffix}`;
+    }
+    return `Showing ${visibleCount} of ${total} ${noun}${scopeSuffix}`;
+  }
+  const noun = total === 1 ? 'page' : 'pages';
+  return `${total} ${noun}${scopeSuffix}`;
 }
 
 /**
@@ -216,13 +210,10 @@ export function patchFolderSearchResults(root, state, buildFolderRow) {
 export function patchPageSearchResults(root, state, siteCtx, buildPageRow) {
   const { visible: visiblePages, statusMap, browseFolder } = getVisiblePages(state);
   const draft = String(state.pageSearch || '').trim();
-  const tooShort = draft.length > 0 && draft.length < SEARCH_MIN_LEN;
 
   const count = root.querySelector('#bulk-pp-page-count');
   if (count) {
-    count.textContent = draft && !tooShort
-      ? `${visiblePages.length} of ${state.pages.length}`
-      : String(state.pages.length);
+    count.textContent = pagesLocationMetaText(state, visiblePages.length);
   }
 
   syncSearchHint(
@@ -234,7 +225,7 @@ export function patchPageSearchResults(root, state, siteCtx, buildPageRow) {
   if (!list) return;
   list.replaceChildren();
   if (state.pages.length === 0) {
-    list.append(el('li', 'bulk-pp-list-empty', 'No pages in this scope.'));
+    list.append(el('li', 'bulk-pp-list-empty', 'No pages in this location.'));
   } else if (visiblePages.length === 0) {
     const emptyMsg = draft
       ? 'No pages match this search.'

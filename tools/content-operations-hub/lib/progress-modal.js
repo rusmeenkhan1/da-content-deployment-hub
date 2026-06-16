@@ -174,18 +174,18 @@ function jobTitle(topic, pageCount) {
 function jobIntro(topic, pageCount) {
   const noun = pageCount === 1 ? 'page' : 'pages';
   if (topic === 'live') {
-    return `Publishing ${pageCount} ${noun} to the live site (.aem.live). Use Stop if you need to close this dialog — work already started on the server will continue.`;
+    return `Publishing ${pageCount} ${noun} to the live site (.aem.live). Use Cancel if you need to close this dialog — work already started on the server will continue.`;
   }
   if (topic === 'unpreview') {
-    return `Removing preview for ${pageCount} ${noun} from .aem.page. Use Stop to close this dialog — removals already started on the server will continue.`;
+    return `Removing preview for ${pageCount} ${noun} from .aem.page. Use Cancel to close this dialog — removals already started on the server will continue.`;
   }
   if (topic === 'unpublish') {
-    return `Removing ${pageCount} ${noun} from the live site (.aem.live). Use Stop to close this dialog — unpublish work already started will continue.`;
+    return `Removing ${pageCount} ${noun} from the live site (.aem.live). Use Cancel to close this dialog — unpublish work already started will continue.`;
   }
   if (topic === 'delete') {
-    return `Permanently deleting ${pageCount} ${noun}: unpreview, unpublish, then remove source files from DA. Use Stop to close this dialog — steps already started will continue.`;
+    return `Permanently deleting ${pageCount} ${noun}: unpreview, unpublish, then remove source files from Document Authoring. Use Cancel to close this dialog — steps already started will continue.`;
   }
-  return `Creating preview deployments for ${pageCount} ${noun} (.aem.page). Use Stop if you need to close this dialog — work already started on the server will continue.`;
+  return `Creating preview deployments for ${pageCount} ${noun} (.aem.page). Use Cancel if you need to close this dialog — work already started on the server will continue.`;
 }
 
 /**
@@ -311,7 +311,7 @@ function buildJobUrlResults(urls, host) {
   const lhsBtn = el(
     'button',
     'bulk-pp-modal-btn bulk-pp-modal-btn-insight',
-    `Check LHS for all (${count})`,
+    `PageSpeed for all (${count})`,
   );
   lhsBtn.type = 'button';
   lhsBtn.title = `Run Lighthouse checks for ${count} URL${count === 1 ? '' : 's'}`;

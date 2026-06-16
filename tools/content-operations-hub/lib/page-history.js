@@ -74,21 +74,21 @@ export function countStatusBreakdown(statusMap, pageList) {
  */
 export function formatDeploymentSummary(platformStatus, pageList) {
   const {
-    live, preview, none, previewed, orphanedLive,
+    live, preview, none, orphanedLive,
   } = countStatusBreakdown(
     historyMapFrom(platformStatus, pageList),
     pageList,
   );
-  return `${live} live · ${orphanedLive} orphaned live · ${previewed} previewed · ${preview} preview only · ${none} not deployed (${pageList.length} total)`;
+  return `${live} published · ${orphanedLive} published without preview · ${preview} preview only · ${none} not deployed (${pageList.length} total)`;
 }
 
 /** @type {ReadonlyArray<[string, string]>} */
 export const PAGE_FILTERS = [
   ['all', 'All pages'],
-  ['never-previewed', 'Not previewed'],
+  ['never-previewed', 'Not deployed (not previewed)'],
   ['never-published', 'Not published'],
   ['preview-only', 'Preview only'],
-  ['orphaned-live', 'Orphaned live'],
+  ['orphaned-live', 'Published without preview'],
   ['recent-preview', 'Recently previewed'],
   ['recent-publish', 'Recently published'],
   ['oldest-preview', 'Oldest previewed'],
@@ -203,18 +203,66 @@ export function filterAndSortPages(
 }
 
 /**
+ * Unambiguous worldwide offset label, e.g. UTC+05:30 or UTC-07:00.
+ * @param {Date} date
+ * @returns {string}
+ */
+export function formatUtcOffset(date) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(abs / 60)).padStart(2, '0');
+  const mins = String(abs % 60).padStart(2, '0');
+  return `UTC${sign}${hours}:${mins}`;
+}
+
+/**
  * @param {number | undefined} ts
  * @returns {string}
  */
 export function formatStatusDate(ts) {
   if (!ts) return '';
-  return new Date(ts).toLocaleString(undefined, {
+  const dt = new Date(ts);
+  return dt.toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
-    hour: '2-digit',
+    hour: 'numeric',
     minute: '2-digit',
   });
+}
+
+/**
+ * Column header for the last-deployed date column (UTC shown once for all rows).
+ * @returns {string}
+ */
+export function formatLastDeployedColumnLabel() {
+  return `Last deployed (${formatUtcOffset(new Date())})`;
+}
+
+/**
+ * Compact label for “Last updated” — time only when today, always with UTC offset.
+ * @param {number | null | undefined} ts
+ * @returns {string}
+ */
+export function formatStatusFetchedAt(ts) {
+  if (!ts || Number.isNaN(ts)) return '';
+  const dt = new Date(ts);
+  const now = new Date();
+  const offset = formatUtcOffset(dt);
+  const time = dt.toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+  if (dt.toDateString() === now.toDateString()) {
+    return `${time} ${offset}`;
+  }
+  const date = dt.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(dt.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}),
+  });
+  return `${date}, ${time} ${offset}`;
 }
 
 /**
@@ -223,6 +271,6 @@ export function formatStatusDate(ts) {
  */
 export function statusLabel(status) {
   if (status === 'published') return 'Published';
-  if (status === 'previewed') return 'only previewed';
-  return 'not previewed';
+  if (status === 'previewed') return 'Preview only';
+  return 'Not deployed';
 }

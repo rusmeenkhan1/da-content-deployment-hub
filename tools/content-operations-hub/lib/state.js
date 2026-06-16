@@ -70,6 +70,13 @@ export function createAppState(ctx) {
     jobTopic: null,
     /** @type {FolderEntry[]} */
     folders: [],
+    /** Cached folder children keyed by normalized parent path ('' = site root). */
+    /** @type {Record<string, FolderEntry[]>} */
+    folderTreeCache: {},
+    /** @type {Set<string>} */
+    expandedFolders: new Set(['']),
+    /** @type {Set<string>} */
+    folderTreeLoading: new Set(),
     /** @type {DocumentEntry[]} */
     pages: [],
     /** @type {Set<string>} */
@@ -115,6 +122,9 @@ export function resetWorkspace(state) {
   state.jobProgressTotal = 0;
   state.jobTopic = null;
   state.folders = [];
+  state.folderTreeCache = {};
+  state.expandedFolders = new Set(['']);
+  state.folderTreeLoading = new Set();
   state.pages = [];
   state.selected.clear();
   cancelStatusCheck(state, false);

@@ -46,6 +46,8 @@ import {
 } from './lib/urls.js';
 import {
   formatStatusDate,
+  formatLastDeployedColumnLabel,
+  formatStatusFetchedAt,
   getPageStatus,
   PAGE_FILTERS,
   countStatusBreakdown,
@@ -76,6 +78,7 @@ import { formatRuntimeStatusEta } from './lib/status-estimate.js';
 import {
   bindSearchInput,
   buildSearchField,
+  pagesLocationMetaText,
   patchFolderSearchResults,
   patchPageSearchResults,
   searchHintText,
@@ -91,7 +94,6 @@ import {
   getActiveSelectionCount,
   getSelectedHelixPaths,
   getVisiblePages,
-  getVisibleFolders,
   isDeploymentStatusPending,
   isFirstSessionStatusPending,
   isStatusFetchBlocking,
@@ -103,6 +105,15 @@ import {
   resetPagesViewState,
   selectAllVisible,
 } from './lib/state.js';
+import {
+  expandFolderAncestors,
+  getFolderCountLabel,
+  hydrateFolderTreeToPath,
+  loadFolderTreeChildren,
+  patchFolderTree,
+  renderFolderTree,
+  seedFolderTreeCache,
+} from './lib/folder-tree.js';
 import { el } from './lib/dom.js';
 
 /* ========================================
@@ -133,26 +144,29 @@ function destructiveStartMessage(action, count) {
   return `Starting unpreview for ${count} ${noun}…`;
 }
 
-/** @type {Record<'untouched'|'previewed'|'published', string>} */
-const STATUS_COLOR = {
-  untouched: '#c9252d',
-  previewed: '#d6ad00',
-  published: '#2d8a4e',
-};
-
 const SDK_URL = 'https://da.live/nx/utils/sdk.js';
 const SDK_TIMEOUT_MS = 8000;
 let copyToastTimer = 0;
+let transientStatusTimer = 0;
+let transientStatusKey = '';
 
 const APP_TITLE = 'Content Operations Hub';
-const APP_DESCRIPTION = 'Browse folders, select pages, and run bulk preview, publish, or removal at the current directory level.';
+const APP_DESCRIPTION = 'Browse site content, monitor deployment status, and run bulk preview, publish, and removal operations.';
 
-/** @type {ReadonlyArray<[keyof typeof STATUS_COLOR, string]>} */
-const STATUS_LEGEND_ITEMS = [
-  ['untouched', 'Not previewed'],
-  ['previewed', 'Preview only'],
-  ['published', 'Published'],
-];
+/**
+ * @param {string} label
+ * @param {string} value
+ * @param {boolean} [muted]
+ */
+function buildMetaBadge(label, value, muted = false) {
+  const badge = el('span', `bulk-pp-badge${muted ? ' bulk-pp-badge-muted' : ''}`);
+  badge.title = label;
+  badge.append(
+    el('span', 'bulk-pp-badge-label', label),
+    el('span', 'bulk-pp-badge-value', value),
+  );
+  return badge;
+}
 
 /** @typedef {import('./lib/state.js').PageOperationId} PageOperationId */
 
@@ -165,29 +179,29 @@ const SELECTION_STRIP_OPS = [
 /** @type {{ title: string, items: { id: PageOperationId, label: string, danger?: boolean }[] }[]} */
 const MORE_SELECTION_GROUPS = [
   {
-    title: 'Navigation',
+    title: 'Open',
     items: [
       { id: 'open-da', label: 'Open in DA' },
       { id: 'open-preview', label: 'Open preview URLs (.page)' },
-      { id: 'open-live', label: 'Open publish URLs (.live)' },
+      { id: 'open-live', label: 'Open published URLs (.live)' },
     ],
   },
   {
     title: 'Performance',
     items: [
-      { id: 'check-lhs-page', label: 'LHS score for .page URL' },
-      { id: 'check-lhs-live', label: 'LHS score for .live URL' },
+      { id: 'check-lhs-page', label: 'PageSpeed — preview URLs' },
+      { id: 'check-lhs-live', label: 'PageSpeed — published URLs' },
     ],
   },
   {
-    title: 'Publishing',
+    title: 'Unpublish',
     items: [
-      { id: 'unpreview', label: 'Remove from preview' },
-      { id: 'unpublish', label: 'Remove from publish' },
+      { id: 'unpreview', label: 'Unpreview' },
+      { id: 'unpublish', label: 'Unpublish' },
     ],
   },
   {
-    title: 'Danger zone',
+    title: 'Remove content',
     items: [
       { id: 'delete', label: 'Delete from DA', danger: true },
     ],
@@ -358,39 +372,52 @@ function syncBrowseLocation(state) {
  * @param {ReturnType<typeof createAppState>} state
  * @param {boolean} workspaceLocked
  */
-function buildPagesSectionHead() {
-  const head = el('div', 'bulk-pp-section-head');
-  const titleWrap = el('div', 'bulk-pp-section-title-wrap');
-  const icon = el('span', 'bulk-pp-section-icon bulk-pp-section-icon-pages');
-  icon.setAttribute('aria-hidden', 'true');
-  titleWrap.append(icon, el('h3', 'bulk-pp-section-title', 'Pages'));
-  head.append(titleWrap);
-  return head;
+function buildPagesScopeControl(state, workspaceLocked) {
+  const locked = workspaceLocked || state.contentLoading;
+  const isTree = state.pageScope === 'tree';
+  const wrap = el('div', 'bulk-pp-pages-scope-inline');
+  wrap.setAttribute('role', 'group');
+  wrap.setAttribute('aria-label', 'Page scope');
+
+  const segment = el('div', 'bulk-pp-pages-scope-segment');
+  const folderBtn = el('button', 'bulk-pp-pages-scope-segment-btn');
+  folderBtn.type = 'button';
+  folderBtn.textContent = 'This folder';
+  folderBtn.disabled = locked;
+  folderBtn.classList.toggle('bulk-pp-pages-scope-segment-btn-active', !isTree);
+  folderBtn.setAttribute('aria-pressed', isTree ? 'false' : 'true');
+
+  const treeBtn = el('button', 'bulk-pp-pages-scope-segment-btn');
+  treeBtn.type = 'button';
+  treeBtn.textContent = 'Include subfolders';
+  treeBtn.disabled = locked;
+  treeBtn.classList.toggle('bulk-pp-pages-scope-segment-btn-active', isTree);
+  treeBtn.setAttribute('aria-pressed', isTree ? 'true' : 'false');
+
+  folderBtn.addEventListener('click', () => {
+    if (!locked && isTree) state.onToggleIncludeSubdirectories(false);
+  });
+  treeBtn.addEventListener('click', () => {
+    if (!locked && !isTree) state.onToggleIncludeSubdirectories(true);
+  });
+
+  segment.append(folderBtn, treeBtn);
+  wrap.append(segment);
+  return wrap;
 }
 
 /**
  * @param {ReturnType<typeof createAppState>} state
- * @param {boolean} workspaceLocked
  */
-function buildPagesScopeRow(state, workspaceLocked) {
-  const locked = workspaceLocked || state.contentLoading;
-  const scopeRow = el('div', 'bulk-pp-pages-scope-row');
-  const scopeCheck = el('input');
-  scopeCheck.type = 'checkbox';
-  scopeCheck.id = 'bulk-pp-include-subdirectories';
-  scopeCheck.checked = state.pageScope === 'tree';
-  scopeCheck.disabled = locked;
-  scopeCheck.addEventListener('change', () => {
-    state.onToggleIncludeSubdirectories(scopeCheck.checked);
-  });
-  const scopeLabel = el('label', 'bulk-pp-pages-scope-check');
-  scopeLabel.htmlFor = 'bulk-pp-include-subdirectories';
-  scopeLabel.append(
-    scopeCheck,
-    document.createTextNode(' Include all subdirectories'),
-  );
-  scopeRow.append(scopeLabel);
-  return scopeRow;
+function buildPagesLocationMeta(state) {
+  const meta = el('span', 'bulk-pp-pages-location-meta');
+  meta.id = 'bulk-pp-page-count';
+  const text = pagesLocationMetaText(state);
+  if (state.pages.length === 0) {
+    meta.classList.add('bulk-pp-pages-location-meta-empty');
+  }
+  meta.textContent = text;
+  return meta;
 }
 
 /**
@@ -414,17 +441,29 @@ function buildSectionHead(title, count, countId = '', variant = 'folders') {
   return head;
 }
 
+const BREADCRUMB_FOLDER_ICON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5h4.2L8 7h5.5a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1Z"/></svg>';
+
+function buildBreadcrumbCurrentLabel(text) {
+  const current = el('span', 'bulk-pp-breadcrumb-current');
+  const icon = el('span', 'bulk-pp-breadcrumb-current-icon');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.innerHTML = BREADCRUMB_FOLDER_ICON;
+  current.append(icon, el('span', 'bulk-pp-breadcrumb-current-text', text));
+  setAccessibilityLabel(current, `Current folder: ${text}`);
+  return current;
+}
+
 function buildBreadcrumb(folderPath, onNavigate, locked = false) {
   const nav = el('nav', 'bulk-pp-breadcrumb');
   nav.setAttribute('aria-label', 'Current folder');
   const normalized = normalizeFolderPath(folderPath);
 
   if (!normalized) {
-    nav.append(el('span', 'bulk-pp-breadcrumb-current', 'Site root'));
+    nav.append(buildBreadcrumbCurrentLabel('Site root'));
     return nav;
   }
 
-  const rootBtn = el('button', 'bulk-pp-breadcrumb-segment', 'Site root');
+  const rootBtn = el('button', 'bulk-pp-breadcrumb-segment bulk-pp-breadcrumb-root', 'Site root');
   rootBtn.type = 'button';
   rootBtn.disabled = locked;
   if (!locked) {
@@ -437,7 +476,7 @@ function buildBreadcrumb(folderPath, onNavigate, locked = false) {
     nav.append(el('span', 'bulk-pp-breadcrumb-sep', '›'));
     const path = segments.slice(0, index + 1).join('/');
     if (index === segments.length - 1) {
-      nav.append(el('span', 'bulk-pp-breadcrumb-current', segment));
+      nav.append(buildBreadcrumbCurrentLabel(segment));
     } else {
       const btn = el('button', 'bulk-pp-breadcrumb-segment', segment);
       btn.type = 'button';
@@ -488,19 +527,34 @@ function buildEmptyBrowseState(state, safeFolder, locked) {
 }
 
 function formatRowModifiedLabel(entry, showStatus) {
-  if (!showStatus || !entry) return '';
+  if (!showStatus) return '—';
+  if (!entry) return '—';
   const ts = Math.max(entry.previewedAt || 0, entry.publishedAt || 0);
-  return ts ? formatStatusDate(ts) : '';
+  return ts ? formatStatusDate(ts) : '—';
 }
 
-function buildPageListColumnHeader() {
+function buildPageListColumnHeader(state) {
   const head = el('div', 'bulk-pp-list-colhead bulk-pp-list-colhead-pages');
-  head.setAttribute('aria-hidden', 'true');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.id = 'bulk-pp-select-all-colhead';
+  cb.className = 'bulk-pp-colhead-select-all-cb';
+  cb.setAttribute('aria-label', 'Select all pages');
+  cb.setAttribute('title', 'Select all pages');
+  if (state) {
+    const active = getActiveSelectionCount(state);
+    const total = getVisiblePages(state).length;
+    cb.checked = total > 0 && active === total;
+    cb.indeterminate = active > 0 && active < total;
+    cb.addEventListener('change', () => {
+      state.onSelectAll(cb.checked);
+    });
+  }
   head.append(
-    el('span', 'bulk-pp-list-colhead-check'),
+    cb,
     el('span', 'bulk-pp-list-colhead-icon'),
     el('span', 'bulk-pp-list-colhead-name', 'Name'),
-    el('span', 'bulk-pp-list-colhead-modified', 'Modified'),
+    el('span', 'bulk-pp-list-colhead-modified', formatLastDeployedColumnLabel()),
     el('span', 'bulk-pp-list-colhead-actions'),
   );
   return head;
@@ -596,7 +650,7 @@ function buildPageRow(
 
   const modifiedText = formatRowModifiedLabel(entry, showStatus);
   const modifiedEl = el('span', 'bulk-pp-item-modified', modifiedText);
-  if (!modifiedText) modifiedEl.setAttribute('aria-hidden', 'true');
+  if (modifiedText === '—' && !showStatus) modifiedEl.classList.add('bulk-pp-item-modified-muted');
 
   const rowActions = el('div', 'bulk-pp-row-actions');
   const daUrl = buildDaEditUrl(
@@ -625,7 +679,7 @@ function buildPageRow(
     daLink.href = daUrl;
     daLink.target = '_top';
     daLink.rel = 'noopener noreferrer';
-    setAccessibilityLabel(daLink, 'Open this page in Document Authoring');
+    setAccessibilityLabel(daLink, 'Open this page in DA');
     daLink.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -699,15 +753,15 @@ async function copySelectedPreviewUrls(state) {
   );
   try {
     await copyTextToClipboard(urls.join('\n'));
-    const noun = urls.length === 1 ? 'URL' : 'URLs';
-    state.status = `Copied ${urls.length} .page ${noun} to clipboard.`;
-    state.statusType = 'success';
-    showCopyToast('Copied', 'URLs have been copied to the clipboard.');
+    showCopyToast(
+      'Copied to clipboard',
+      `${urls.length} preview ${urls.length === 1 ? 'URL' : 'URLs'} ready to paste.`,
+    );
   } catch {
-    state.status = 'Unable to copy .page URLs. Check clipboard permissions and try again.';
+    state.status = 'Unable to copy preview URLs. Check clipboard permissions and try again.';
     state.statusType = 'error';
+    if (state.root) render(/** @type {HTMLElement} */ (state.root), state);
   }
-  if (state.root) render(/** @type {HTMLElement} */ (state.root), state);
 }
 
 /**
@@ -724,16 +778,77 @@ function showCopyToast(title, message) {
   toast.setAttribute('aria-live', 'polite');
 
   const head = el('div', 'bulk-pp-copy-toast-head');
-  const icon = el('span', 'bulk-pp-copy-toast-icon', 'i');
+  const icon = el('span', 'bulk-pp-copy-toast-icon');
   icon.setAttribute('aria-hidden', 'true');
+  icon.innerHTML = '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.5 3.5 7-7"/></svg>';
   head.append(icon, el('span', 'bulk-pp-copy-toast-title', title));
   toast.append(head, el('p', 'bulk-pp-copy-toast-message', message));
 
-  document.body.append(toast);
+  const stripAnchor = document.getElementById('bulk-pp-selection-bar');
+  if (stripAnchor && !stripAnchor.hidden) {
+    stripAnchor.append(toast);
+  } else {
+    toast.classList.add('bulk-pp-copy-toast-fallback');
+    document.body.append(toast);
+  }
   copyToastTimer = window.setTimeout(() => {
     toast.remove();
     copyToastTimer = 0;
   }, 2600);
+}
+
+/**
+ * @param {'error'|'success'|'info'} statusType
+ */
+function statusAutoDismissDelay(statusType) {
+  return statusType === 'error' ? 9000 : 5200;
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
+ */
+function clearTransientStatus(state) {
+  state.status = null;
+  state.jobDetail = null;
+  if (transientStatusTimer) {
+    window.clearTimeout(transientStatusTimer);
+    transientStatusTimer = 0;
+  }
+  transientStatusKey = '';
+  const root = /** @type {HTMLElement | null} */ (state.root);
+  if (root) render(root, state);
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
+ * @param {'error'|'success'|'info'} statusType
+ */
+function scheduleTransientStatusClear(state, statusType) {
+  const statusText = state.status || '';
+  const detail = state.jobDetail || '';
+  const key = `${statusType}:${statusText}:${detail}`;
+  if (transientStatusKey === key && transientStatusTimer) return;
+  if (transientStatusTimer) {
+    window.clearTimeout(transientStatusTimer);
+    transientStatusTimer = 0;
+  }
+  transientStatusKey = key;
+  const delay = statusAutoDismissDelay(statusType);
+  transientStatusTimer = window.setTimeout(() => {
+    if (
+      state.status === statusText
+      && (state.jobDetail || '') === detail
+      && state.statusType === statusType
+      && !state.loading
+      && !state.statusChecking
+      && !state.contentLoading
+    ) {
+      clearTransientStatus(state);
+      return;
+    }
+    transientStatusTimer = 0;
+    transientStatusKey = '';
+  }, delay);
 }
 
 async function openSelectedDa(state) {
@@ -935,27 +1050,26 @@ function buildSelectionActionBar(state) {
 
   const left = el('div', 'bulk-pp-selection-strip-left');
   const badge = el('div', 'bulk-pp-selection-strip-badge');
+
+  const dismissBtn = el('button', 'bulk-pp-selection-dismiss');
+  dismissBtn.type = 'button';
+  dismissBtn.id = 'bulk-pp-selection-clear';
+  dismissBtn.innerHTML = '<span class="bulk-pp-selection-dismiss-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg></span>';
+  setAccessibilityLabel(dismissBtn, 'Clear selection');
+  dismissBtn.addEventListener('click', () => {
+    state.selected.clear();
+    state.onSelectionChange();
+  });
+
   const countEl = el(
     'span',
     'bulk-pp-selection-count',
     formatSelectionBarText(count),
   );
   countEl.id = 'bulk-pp-selection-count';
-  badge.append(countEl);
+  badge.append(dismissBtn, countEl);
 
-  const selectAllBtn = el('button', 'bulk-pp-selection-clear', 'Select all');
-  selectAllBtn.type = 'button';
-  selectAllBtn.id = 'bulk-pp-select-all';
-  setAccessibilityLabel(selectAllBtn, 'Select all visible pages');
-  selectAllBtn.disabled = blocked || getVisiblePages(state).length === 0;
-  selectAllBtn.addEventListener('click', () => state.onSelectAll(true));
-
-  const clearBtn = el('button', 'bulk-pp-selection-clear', 'Clear selection');
-  clearBtn.type = 'button';
-  clearBtn.id = 'bulk-pp-select-none';
-  setAccessibilityLabel(clearBtn, 'Clear selection');
-  clearBtn.disabled = blocked;
-  clearBtn.addEventListener('click', () => state.onSelectAll(false));
+  const shareWrap = el('div', 'bulk-pp-selection-share-wrap');
   const shareBtn = el(
     'button',
     'bulk-pp-selection-strip-btn bulk-pp-selection-strip-btn-share',
@@ -963,7 +1077,7 @@ function buildSelectionActionBar(state) {
   );
   shareBtn.type = 'button';
   shareBtn.id = 'bulk-pp-selection-share';
-  setAccessibilityLabel(shareBtn, 'Share selected preview URLs');
+  setAccessibilityLabel(shareBtn, formatShareTooltipText(count));
   shareBtn.disabled = blocked;
   shareBtn.append(
     buildSelectionOpIcon('share'),
@@ -972,7 +1086,14 @@ function buildSelectionActionBar(state) {
   shareBtn.addEventListener('click', () => {
     void copySelectedPreviewUrls(state);
   });
-  left.append(badge, selectAllBtn, clearBtn);
+  const shareTip = el(
+    'span',
+    'bulk-pp-selection-share-tooltip',
+    formatShareTooltipText(count),
+  );
+  shareTip.id = 'bulk-pp-selection-share-tooltip';
+  shareWrap.append(shareBtn, shareTip);
+  left.append(badge);
 
   const actions = el('div', 'bulk-pp-selection-strip-actions');
   const deployGroup = el(
@@ -985,7 +1106,7 @@ function buildSelectionActionBar(state) {
     btn.disabled = blocked;
     deployGroup.append(btn);
   });
-  actions.append(deployGroup, shareBtn);
+  actions.append(deployGroup, shareWrap);
 
   const moreWrap = el('div', 'bulk-pp-selection-more-wrap');
   const moreBtn = el(
@@ -1044,6 +1165,14 @@ function buildSelectionActionBar(state) {
  */
 function formatSelectionBarText(count) {
   return count === 1 ? '1 page selected' : `${count} pages selected`;
+}
+
+/**
+ * @param {number} count
+ */
+function formatShareTooltipText(count) {
+  if (count === 1) return 'Copy preview URL to clipboard';
+  return `Copy ${count} preview URLs to clipboard`;
 }
 
 /* ========================================
@@ -1124,7 +1253,7 @@ function applyOperationWorkspaceReset(state) {
     { org: state.org, site: state.site, ref: state.ref },
     buildPageRow,
   );
-  patchFolderSearchResults(root, state, buildFolderRow);
+  patchFolderSearchResults(root, state);
   syncSelectionUI(root, state);
 }
 
@@ -1177,9 +1306,8 @@ function clearPagesStatusDisplay(state) {
 function patchPagesHeader(root, state) {
   const host = safeQuery(root, '.bulk-pp-pages-header');
   if (!host) return;
-  const statusTools = safeQuery(host, '.bulk-pp-pages-status-tools');
   host.replaceWith(
-    buildPagesHeader(state, isStatusFetchBlocking(state), statusTools),
+    buildPagesHeader(state, isStatusFetchBlocking(state)),
   );
 }
 
@@ -1235,39 +1363,74 @@ function buildPagesSelectionRow(state, { visiblePages }) {
 }
 
 /**
+ * Compact last-updated label + refresh control for the unified header toolbar.
+ * @param {ReturnType<typeof createAppState>} state
+ */
+function buildStatusActionInline(state) {
+  const wrap = el('div', 'bulk-pp-pages-status-inline');
+  const when = formatStatusFetchedAt(state.statusFetchedAt);
+  const meta = el('span', 'bulk-pp-pages-status-inline-meta');
+  if (!when) {
+    meta.textContent = 'Status not loaded';
+  } else if (state.statusFetchedFromCache) {
+    meta.textContent = `Updated ${when} · cached`;
+  } else {
+    meta.textContent = `Updated ${when}`;
+  }
+  wrap.append(meta, buildRealtimeStatusButton(state));
+  return wrap;
+}
+
+/**
  * @param {ReturnType<typeof createAppState>} state
  * @param {boolean} workspaceLocked
  */
-function buildPagesHeader(state, workspaceLocked, statusTools = null) {
+function buildPagesHeader(state, workspaceLocked) {
   const header = el('div', 'bulk-pp-pages-header');
-  const topRow = el('div', 'bulk-pp-pages-header-top');
-  const mainSection = el('div', 'bulk-pp-pages-header-main');
+  const bar = el('div', 'bulk-pp-pages-context-bar');
+
+  const primary = el('div', 'bulk-pp-pages-context-primary');
   const breadcrumb = buildBreadcrumb(
     state.folderPath,
     (path) => state.onNavigate(path),
     workspaceLocked,
   );
   breadcrumb.classList.add('bulk-pp-pages-breadcrumb');
-  const directoryBlock = el('div', 'bulk-pp-pages-directory');
-  directoryBlock.append(
-    el('span', 'bulk-pp-pages-directory-label', 'Current directory'),
-    breadcrumb,
-    buildPagesScopeRow(state, workspaceLocked),
-  );
-  mainSection.append(buildPagesSectionHead(), directoryBlock);
+  primary.append(breadcrumb);
 
-  const aside = el('div', 'bulk-pp-pages-header-aside');
   if (state.pages.length > 0) {
-    aside.append(buildPagesStatusSummary(state));
-    aside.append(buildStatusActionCard(state));
-    if (statusTools) aside.append(statusTools);
-  } else {
-    const countEl = el('span', 'bulk-pp-section-count', '0');
-    countEl.id = 'bulk-pp-page-count';
-    aside.append(countEl);
+    primary.append(buildPagesStatusSummary(state));
   }
-  topRow.append(mainSection, aside);
-  header.append(topRow);
+  bar.append(primary);
+
+  const toolbar = el('div', 'bulk-pp-pages-context-toolbar');
+  const toolbarLeft = el('div', 'bulk-pp-pages-context-toolbar-left');
+  toolbarLeft.append(
+    buildPagesLocationMeta(state),
+    buildPagesScopeControl(state, workspaceLocked),
+  );
+  toolbar.append(toolbarLeft);
+
+  const toolbarRight = el('div', 'bulk-pp-pages-context-toolbar-right');
+  if (state.pages.length > 0) {
+    toolbarRight.append(buildStatusActionInline(state));
+    if (
+      (state.statusChecking || state.statusRevalidating)
+      && !isDeploymentStatusPending(state)
+    ) {
+      const hintText = state.statusRevalidating && !state.statusChecking
+        ? 'Refreshing…'
+        : 'Updating…';
+      toolbarRight.append(el('span', 'bulk-pp-pages-status-hint', hintText));
+    }
+  } else {
+    toolbarRight.append(
+      el('p', 'bulk-pp-pages-context-empty', 'Open a folder with pages to see deployment status.'),
+    );
+  }
+  toolbar.append(toolbarRight);
+  bar.append(toolbar);
+  header.append(bar);
 
   return header;
 }
@@ -1432,6 +1595,67 @@ async function runRemovePartitionJob(
 }
 
 /**
+ * @param {string[]} paths
+ * @param {Record<string, { previewedAt?: number, publishedAt?: number }>} platformStatus
+ */
+function pathsNeedingPreviewBeforePublish(paths, platformStatus) {
+  return paths.filter((path) => {
+    const entry = platformStatus[path];
+    return !entry?.previewedAt;
+  });
+}
+
+/**
+ * @param {ReturnType<typeof createAppState>} state
+ * @param {Function} daFetch
+ * @param {'preview'|'live'} topic
+ * @param {string[]} paths
+ * @param {string} [phaseLabel]
+ */
+async function runBulkDeployJob(state, daFetch, topic, paths, phaseLabel = '') {
+  const bulkResp = await startBulkJob(
+    daFetch,
+    state.org,
+    state.site,
+    state.ref,
+    topic,
+    paths,
+  );
+  if (state.jobAbort?.signal.aborted) {
+    return { statusType: /** @type {const} */ ('info'), message: 'cancelled', finalJob: null };
+  }
+
+  const jobUrl = getJobPollUrl(
+    bulkResp,
+    state.org,
+    state.site,
+    state.ref,
+    topic,
+  );
+  if (!jobUrl) {
+    return {
+      statusType: /** @type {const} */ ('success'),
+      message: `scheduled (${paths.length} page${paths.length === 1 ? '' : 's'})`,
+      finalJob: bulkResp,
+    };
+  }
+
+  const finalJob = await pollJob(
+    daFetch,
+    jobUrl,
+    (job) => {
+      if (state.jobAbort?.signal.aborted) return;
+      applyJobProgress(state, paths, phaseLabel, job);
+    },
+    state.jobAbort?.signal,
+  );
+  if (state.jobAbort?.signal.aborted) {
+    return { statusType: /** @type {const} */ ('info'), message: 'cancelled', finalJob: null };
+  }
+  return { ...resolveJobOutcome(finalJob), finalJob };
+}
+
+/**
  * @param {string} message
  */
 function formatStatusAccessMessage(message) {
@@ -1458,19 +1682,6 @@ function buildPagesStatusNotice(state) {
     return note;
   }
   return null;
-}
-
-function buildStatusLegend() {
-  const legend = el('div', 'bulk-pp-status-legend');
-  legend.setAttribute('aria-label', 'Deployment status key');
-  STATUS_LEGEND_ITEMS.forEach(([key, text]) => {
-    const item = el('span', 'bulk-pp-legend-item');
-    const dot = el('span', 'bulk-pp-legend-dot');
-    dot.style.background = STATUS_COLOR[key];
-    item.append(dot, document.createTextNode(text));
-    legend.append(item);
-  });
-  return legend;
 }
 
 /**
@@ -1524,10 +1735,10 @@ function buildPagesStatusSummary(state) {
 
   /** @type {[string, number, string][]} */
   const items = [
-    ['live', live, 'Published pages'],
-    ['preview', previewOnly, 'Only Previewed Pages'],
-    ['none', none, 'Not deployed pages'],
-    ['total', total, 'Total Pages'],
+    ['live', live, 'Published'],
+    ['preview', previewOnly, 'Preview only'],
+    ['none', none, 'Not deployed'],
+    ['total', total, 'Total'],
   ];
   items.forEach(([mod, value, label]) => {
     const item = el(
@@ -1576,62 +1787,24 @@ function buildPagesFilterField(state, pageFilter, contentLoading) {
 function buildRealtimeStatusButton(state) {
   const btn = el(
     'button',
-    'bulk-pp-btn bulk-pp-btn-fetch-deployment bulk-pp-pages-refresh-status',
+    'bulk-pp-btn bulk-pp-btn-refresh-status bulk-pp-pages-refresh-status',
   );
   btn.type = 'button';
   btn.disabled = state.pages.length === 0
     || state.contentLoading
     || state.loading
     || state.statusChecking;
-  setAccessibilityLabel(btn, 'Fetch live deployment status');
-  btn.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 3.5v3.2h-3.2"/></svg>';
+  setAccessibilityLabel(btn, 'Refresh deployment status');
+  const icon = el('span', 'bulk-pp-btn-refresh-status-icon');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.innerHTML = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 3.5v3.2h-3.2"/></svg>';
+  btn.append(icon, el('span', 'bulk-pp-btn-refresh-status-label', 'Refresh status'));
   btn.addEventListener('click', () => {
     if (typeof state.onRefreshStatus === 'function') {
       state.onRefreshStatus();
     }
   });
   return btn;
-}
-
-/**
- * @param {number | null | undefined} ts
- */
-function formatStatusFetchedAt(ts) {
-  if (!ts || Number.isNaN(ts)) return '';
-  const dt = new Date(ts);
-  const now = new Date();
-  if (dt.toDateString() === now.toDateString()) {
-    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  }
-  return dt.toLocaleString([], {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
-}
-
-/**
- * @param {ReturnType<typeof createAppState>} state
- */
-function buildStatusActionCard(state) {
-  const card = el('div', 'bulk-pp-status-action-card');
-
-  const left = el('div', 'bulk-pp-status-action-left');
-  const label = el('span', 'bulk-pp-status-action-label');
-  const when = formatStatusFetchedAt(state.statusFetchedAt);
-  if (!when) {
-    label.textContent = 'Last fetched: not yet fetched';
-  } else {
-    label.textContent = state.statusFetchedFromCache
-      ? `Last fetched: ${when} (cached)`
-      : `Last fetched: ${when}`;
-  }
-  left.append(label);
-  left.append(buildRealtimeStatusButton(state));
-
-  card.append(left);
-  return card;
 }
 
 /**
@@ -1681,15 +1854,16 @@ function buildPagesStatusProgressBar(state) {
     el(
       'span',
       'bulk-pp-pages-status-progress-title',
-      'Fetching deployment status',
+      'Checking deployment status',
     ),
   );
   const stopBtn = el(
     'button',
     'bulk-pp-btn bulk-pp-btn-text bulk-pp-pages-status-progress-stop',
-    'Stop',
+    'Cancel',
   );
   stopBtn.type = 'button';
+  setAccessibilityLabel(stopBtn, 'Cancel deployment status fetch');
   stopBtn.addEventListener('click', () => state.onCancelStatus());
   head.append(stopBtn);
   bar.append(head);
@@ -1845,6 +2019,9 @@ function finishProgressModal(state) {
   state.jobTopic = null;
   state.jobAbort = null;
   state.jobStartedAt = null;
+  if (state.statusType === 'success') {
+    state.status = null;
+  }
   if (root) render(root, state);
 }
 
@@ -1858,13 +2035,13 @@ function buildContentLoadingPanel(isFirstLoad = false) {
   spinner.setAttribute('aria-hidden', 'true');
   inner.append(
     spinner,
-    el('p', 'bulk-pp-content-loading-title', 'Fetching content…'),
+    el('p', 'bulk-pp-content-loading-title', 'Loading content'),
     el(
       'p',
       'bulk-pp-content-loading-sub',
       isFirstLoad
-        ? 'Loading folders, pages, and deployment status…'
-        : 'Updating folders and pages…',
+        ? 'Reading folders, pages, and deployment status for this location.'
+        : 'Refreshing the current folder…',
     ),
   );
   loading.append(inner);
@@ -1876,13 +2053,18 @@ function buildFirstSessionFetchOverlay() {
   overlay.id = 'bulk-pp-first-session-overlay';
   overlay.setAttribute('role', 'status');
   overlay.setAttribute('aria-live', 'polite');
-  overlay.setAttribute('aria-label', 'Fetching content');
+  overlay.setAttribute('aria-label', 'Loading deployment status');
   const inner = el('div', 'bulk-pp-first-session-overlay-inner');
   const spinner = el('div', 'bulk-pp-spinner');
   spinner.setAttribute('aria-hidden', 'true');
   inner.append(
     spinner,
-    el('p', 'bulk-pp-content-loading-title', 'Fetching content…'),
+    el('p', 'bulk-pp-content-loading-title', 'Checking deployment status'),
+    el(
+      'p',
+      'bulk-pp-content-loading-sub',
+      'This runs once when you open a folder. You can continue browsing afterward.',
+    ),
   );
   overlay.append(inner);
   return overlay;
@@ -1906,7 +2088,7 @@ function buildPagesStatusSummaryLoading() {
  * @param {ReturnType<typeof createAppState>} state
  */
 function render(root, state) {
-  const listWrapBefore = document.getElementById('bulk-pp-page-list-wrap');
+  const listWrapBefore = document.getElementById('bulk-pp-page-list-scroll');
   const savedListScroll = listWrapBefore ? listWrapBefore.scrollTop : null;
 
   const {
@@ -1931,13 +2113,10 @@ function render(root, state) {
     statusMap,
     browseFolder,
   } = getVisiblePages(state);
-  const visibleFolders = getVisibleFolders(state);
   const workspaceLocked = isStatusFetchBlocking(state);
   const safeFolder = resolveContentFolderPath(folderPath);
   const searchDraft = String(pageSearch || '').trim();
   const searchTooShort = searchDraft.length > 0 && searchDraft.length < SEARCH_MIN_LEN;
-  const folderSearchDraft = String(folderSearch || '').trim();
-  const folderSearchTooShort = folderSearchDraft.length > 0 && folderSearchDraft.length < SEARCH_MIN_LEN;
 
   root.replaceChildren();
   root.classList.add('bulk-pp-shell');
@@ -1957,13 +2136,11 @@ function render(root, state) {
     el('p', 'bulk-pp-header-desc', APP_DESCRIPTION),
   );
   const headerMeta = el('div', 'bulk-pp-header-meta');
-  const branchBadge = el('span', 'bulk-pp-badge bulk-pp-badge-muted', ref);
-  branchBadge.title = 'Branch';
-  const repoBadge = el('span', 'bulk-pp-badge bulk-pp-badge-muted', site);
-  repoBadge.title = 'Repository';
-  const orgBadge = el('span', 'bulk-pp-badge', org);
-  orgBadge.title = 'Organization';
-  headerMeta.append(branchBadge, repoBadge, orgBadge);
+  headerMeta.append(
+    buildMetaBadge('Branch', ref, true),
+    buildMetaBadge('Site', site, true),
+    buildMetaBadge('Organization', org),
+  );
   headerInner.append(headerBrand, headerMeta);
   header.append(headerInner);
   root.append(header);
@@ -1974,7 +2151,14 @@ function render(root, state) {
   );
   const contentHead = el('div', 'bulk-pp-panel-head');
   const contentHeadMain = el('div', 'bulk-pp-panel-head-main');
-  contentHeadMain.append(el('h2', null, 'Site content'));
+  contentHeadMain.append(
+    el('h2', null, 'Site content'),
+    el(
+      'p',
+      'bulk-pp-panel-head-desc',
+      'Navigate directories and manage pages at the current folder level.',
+    ),
+  );
   contentHead.append(contentHeadMain);
   contentPanel.append(contentHead);
   const contentBody = el('div', 'bulk-pp-panel-body bulk-pp-content-body');
@@ -1997,29 +2181,19 @@ function render(root, state) {
       'section',
       'bulk-pp-content-section bulk-pp-content-section-folders',
     );
-    const folderCountLabel = folderSearchDraft && !folderSearchTooShort
-      ? `${visibleFolders.length} of ${state.folders.length}`
-      : String(state.folders.length);
     folderSection.append(
       buildSectionHead(
         'Directories',
-        folderCountLabel,
+        getFolderCountLabel(state),
         'bulk-pp-folder-count',
         'folders',
       ),
     );
-    folderSection.append(
-      buildBreadcrumb(
-        safeFolder,
-        (path) => state.onNavigate(path),
-        workspaceLocked,
-      ),
-    );
 
-    const folderSearchDisabled = workspaceLocked || state.folders.length === 0;
+    const folderSearchDisabled = workspaceLocked;
     const { wrap: folderSearchField, input: folderSearchInput } = buildSearchField(
       'bulk-pp-folder-search',
-      'Search folder',
+      'Search folders',
       String(folderSearch || ''),
       folderSearchDisabled,
       searchHintText(folderSearch),
@@ -2028,31 +2202,24 @@ function render(root, state) {
     folderSearchRow.append(folderSearchField);
     folderSection.append(folderSearchRow);
 
-    const folderWrap = el('div', 'bulk-pp-list-wrap bulk-pp-list-wrap-folders');
-    const folderList = el('ul', 'bulk-pp-list');
-    folderList.id = 'bulk-pp-folder-list';
-    if (visibleFolders.length === 0) {
-      const folderEmptyMsg = folderSearchDraft
-        ? 'No folders match this search.'
-        : 'no directory to show';
-      folderList.append(el('li', 'bulk-pp-list-empty', folderEmptyMsg));
-    } else {
-      visibleFolders.forEach((folder) => {
-        folderList.append(
-          buildFolderRow(
-            folder,
-            (path) => state.onNavigate(path),
-            workspaceLocked,
-          ),
-        );
-      });
-    }
-    folderWrap.append(folderList);
+    const folderWrap = el(
+      'div',
+      'bulk-pp-list-wrap bulk-pp-list-wrap-folders bulk-pp-list-wrap-tree',
+    );
+    const folderTreeHost = el('div', 'bulk-pp-folder-tree-host');
+    folderTreeHost.id = 'bulk-pp-folder-tree-host';
+    renderFolderTree(
+      folderTreeHost,
+      state,
+      (path) => state.onNavigate(path),
+      workspaceLocked,
+    );
+    folderWrap.append(folderTreeHost);
     folderSection.append(folderWrap);
     contentGrid.append(folderSection);
 
     bindSearchInput(folderSearchInput, state, 'folder', () => {
-      patchFolderSearchResults(root, state, buildFolderRow);
+      patchFolderSearchResults(root, state);
     });
 
     const pagesSection = el(
@@ -2063,7 +2230,6 @@ function render(root, state) {
       pagesSection.append(buildPagesStatusProgressBar(state));
     }
 
-    const statusTools = el('div', 'bulk-pp-pages-status-tools');
     const { filterField, filterSelect } = buildPagesFilterField(
       state,
       String(pageFilter || 'all'),
@@ -2072,23 +2238,7 @@ function render(root, state) {
         || isDeploymentStatusPending(state),
     );
 
-    if (state.pages.length > 0 && !isFirstSessionStatusPending(state)) {
-      const legendRow = el('div', 'bulk-pp-pages-legend-row');
-      legendRow.id = 'bulk-pp-pages-legend-row';
-      legendRow.append(buildStatusLegend());
-      if (
-        (statusChecking || state.statusRevalidating)
-        && !isDeploymentStatusPending(state)
-      ) {
-        const hintText = state.statusRevalidating && !statusChecking
-          ? 'Refreshing status…'
-          : 'Updating status…';
-        legendRow.append(el('span', 'bulk-pp-pages-status-hint', hintText));
-      }
-      statusTools.append(legendRow);
-    }
-
-    pagesSection.append(buildPagesHeader(state, workspaceLocked, statusTools));
+    pagesSection.append(buildPagesHeader(state, workspaceLocked));
 
     const controls = el('div', 'bulk-pp-pages-controls');
 
@@ -2096,7 +2246,7 @@ function render(root, state) {
     const pageSearchDisabled = workspaceLocked || state.pages.length === 0;
     const { wrap: searchField, input: searchInput } = buildSearchField(
       'bulk-pp-page-search',
-      'Search page',
+      'Search pages',
       String(pageSearch || ''),
       pageSearchDisabled,
       searchHintText(pageSearch),
@@ -2118,13 +2268,13 @@ function render(root, state) {
     pageWrap.id = 'bulk-pp-page-list-wrap';
     if (!isFirstSessionStatusPending(state)) {
       if (state.pages.length > 0) {
-        pageWrap.append(buildPageListColumnHeader());
+        pageWrap.append(buildPageListColumnHeader(state));
       }
       const pageList = el('ul', 'bulk-pp-list');
       pageList.id = 'bulk-pp-page-list';
       if (state.pages.length === 0) {
         pageList.append(
-          el('li', 'bulk-pp-list-empty', 'no pages to show'),
+          el('li', 'bulk-pp-list-empty', 'No pages in this location.'),
         );
       } else if (visiblePages.length === 0) {
         const emptyMsg = searchDraft
@@ -2146,9 +2296,15 @@ function render(root, state) {
           );
         });
       }
-      pageWrap.append(pageList);
+      const listScroll = el('div', 'bulk-pp-page-list-scroll');
+      listScroll.id = 'bulk-pp-page-list-scroll';
+      listScroll.append(pageList);
+      pageWrap.append(listScroll);
     }
     pagesSection.append(pageWrap);
+    if (!isFirstSessionStatusPending(state)) {
+      pagesSection.append(buildSelectionActionBar(state));
+    }
     contentGrid.append(pagesSection);
     workspace.append(contentGrid);
     contentBody.append(workspace);
@@ -2162,21 +2318,36 @@ function render(root, state) {
   contentPanel.append(contentBody);
   root.append(contentPanel);
 
-  if (!isFirstSessionStatusPending(state)) {
-    root.append(buildSelectionActionBar(state));
-  }
-
   if (
     status
     && !statusChecking
-    && statusType === 'error'
+    && !contentLoading
     && !isDaAccessError(status)
+    && (statusType === 'error' || statusType === 'info')
   ) {
     const statusEl = el('div', `bulk-pp-status bulk-pp-status-${statusType}`);
-    statusEl.setAttribute('role', 'alert');
+    statusEl.setAttribute('role', statusType === 'error' ? 'alert' : 'status');
     statusEl.setAttribute('aria-live', 'polite');
-    statusEl.append(el('strong', null, status));
+    const body = el('div', 'bulk-pp-status-main');
+    const icon = el('span', `bulk-pp-status-icon bulk-pp-status-icon-${statusType}`);
+    icon.setAttribute('aria-hidden', 'true');
+    const iconSvg = statusType === 'error'
+      ? '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"></circle><path d="M8 4.5v4"></path><path d="M8 11.5h.01"></path></svg>'
+      : '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"></path></svg>';
+    icon.innerHTML = iconSvg;
+    const text = el('div', 'bulk-pp-status-text');
+    text.append(el('strong', null, status));
+    body.append(icon, text);
+    statusEl.append(body);
     if (jobDetail) statusEl.append(el('pre', 'bulk-pp-error-detail', jobDetail));
+
+    const closeBtn = el('button', 'bulk-pp-status-close', 'Dismiss');
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', 'Dismiss status message');
+    closeBtn.addEventListener('click', () => clearTransientStatus(state));
+    statusEl.append(closeBtn);
+
+    scheduleTransientStatusClear(state, statusType);
     root.append(statusEl);
   } else if (
     jobDetail
@@ -2185,11 +2356,17 @@ function render(root, state) {
     const statusEl = el('div', 'bulk-pp-status bulk-pp-status-info');
     statusEl.append(el('pre', 'bulk-pp-error-detail', jobDetail));
     root.append(statusEl);
+  } else {
+    if (transientStatusTimer) {
+      window.clearTimeout(transientStatusTimer);
+      transientStatusTimer = 0;
+    }
+    transientStatusKey = '';
   }
 
   requestAnimationFrame(() => {
     if (savedListScroll != null) {
-      const listWrap = document.getElementById('bulk-pp-page-list-wrap');
+      const listWrap = document.getElementById('bulk-pp-page-list-scroll');
       if (listWrap) listWrap.scrollTop = savedListScroll;
     }
   });
@@ -2416,9 +2593,7 @@ function startStatusCheck(
       state.statusProgressTotal = pathsToCheck.length;
       state.statusFetchedAt = Date.now();
       state.statusFetchedFromCache = false;
-      state.status = forceRefresh
-        ? 'Fetched the latest deployment status from server.'
-        : null;
+      state.status = null;
       state.statusType = 'info';
       refreshDeploymentUi(state);
       finishStatusFetch(state);
@@ -2624,7 +2799,7 @@ async function main() {
     const topic = /** @type {JobTopic} */ (state.jobTopic || 'preview');
     const actionLabel = jobActionLabel(topic);
     showJobCancelledModal({
-      message: `You stopped tracking this bulk ${actionLabel} operation. If it already started on the server, work may still be in progress. Check the Pages panel or run Fetch Deployment status again.`,
+      message: `You stopped tracking this bulk ${actionLabel} operation. If it already started on the server, work may still be in progress. Refresh deployment status to see the latest state.`,
       topic,
       onClose: () => {
         state.status = null;
@@ -2641,11 +2816,34 @@ async function main() {
     clearPagesStatusDisplay(state);
 
     state.folderPath = resolveContentFolderPath(targetPath);
+    expandFolderAncestors(state, targetPath);
     state.pageSearch = '';
     state.folderSearch = '';
     state.pageFilter = 'all';
     syncBrowseLocation(state);
     await state.onFetch(true);
+  };
+
+  state.onExpandFolder = async (folderPath, expand) => {
+    if (isStatusFetchBlocking(state) || state.contentLoading) return;
+    const key = normalizeFolderPath(folderPath);
+    if (!expand) {
+      state.expandedFolders.delete(key);
+    } else {
+      state.expandedFolders.add(key);
+      if (!state.folderTreeCache[key]) {
+        await loadFolderTreeChildren(state, daFetch, key);
+      }
+    }
+    const rootEl = /** @type {HTMLElement | null} */ (state.root);
+    if (rootEl) {
+      patchFolderTree(
+        rootEl,
+        state,
+        (path) => state.onNavigate(path),
+        isStatusFetchBlocking(state),
+      );
+    }
   };
 
   state.onToggleIncludeSubdirectories = async (enabled) => {
@@ -2689,7 +2887,7 @@ async function main() {
     state.statusCheckFailed = false;
     state.statusError = null;
     state.statusPanelNote = null;
-    state.status = 'Fetching content…';
+    state.status = null;
     state.statusType = 'info';
     render(app, state);
 
@@ -2702,6 +2900,9 @@ async function main() {
         state.folderPath,
       );
       state.folders = browseEntries.filter((e) => e.kind === 'folder');
+      seedFolderTreeCache(state, state.folderPath, state.folders);
+      expandFolderAncestors(state, state.folderPath);
+      await hydrateFolderTreeToPath(state, daFetch, state.folderPath);
 
       if (state.pageScope === 'tree') {
         const nestedPages = await collectPages(
@@ -2822,91 +3023,94 @@ async function main() {
     const action = topic === 'live' ? 'Bulk publish' : 'Bulk preview';
 
     try {
-      const bulkResp = await startBulkJob(
+      /** @type {string[]} */
+      let previewFirst = [];
+      if (topic === 'live') {
+        previewFirst = pathsNeedingPreviewBeforePublish(paths, state.platformStatus);
+        if (previewFirst.length > 0) {
+          const previewPhase = previewFirst.length === paths.length
+            ? 'Step 1 of 2 · Preview before publish'
+            : `Step 1 of 2 · Preview ${previewFirst.length} page${previewFirst.length === 1 ? '' : 's'} before publish`;
+          state.jobProgressProcessed = 0;
+          state.jobProgressTotal = previewFirst.length;
+          updateJobModal({
+            jobStartedAt: state.jobStartedAt,
+            processed: 0,
+            total: previewFirst.length,
+            failed: 0,
+            stateLabel: 'running',
+            phaseLabel: previewPhase,
+          });
+          const previewOutcome = await runBulkDeployJob(
+            state,
+            daFetch,
+            'preview',
+            previewFirst,
+            previewPhase,
+          );
+          if (state.jobAbort?.signal.aborted) return;
+          if (previewOutcome.statusType === 'error') {
+            const previewMessage = `Preview before publish ${previewOutcome.message}`;
+            state.status = previewMessage;
+            state.statusType = 'error';
+            showJobErrorModal({
+              message: previewMessage,
+              topic: 'preview',
+              hint: permissionErrorHint(0, previewMessage),
+              onClose: () => finishProgressModal(state),
+            });
+            return;
+          }
+          await refreshPlatformStatusAfterJob(state, daFetch, previewFirst, 'preview');
+          state.jobProgressProcessed = 0;
+          state.jobProgressTotal = paths.length;
+          updateJobModal({
+            jobStartedAt: state.jobStartedAt,
+            processed: 0,
+            total: paths.length,
+            failed: 0,
+            stateLabel: 'running',
+            phaseLabel: 'Step 2 of 2 · Publish',
+          });
+        }
+      }
+
+      const publishPhase = previewFirst.length > 0 ? 'Step 2 of 2 · Publish' : '';
+      const deployOutcome = await runBulkDeployJob(
+        state,
         daFetch,
-        state.org,
-        state.site,
-        state.ref,
         topic,
         paths,
+        publishPhase,
       );
       if (state.jobAbort?.signal.aborted) return;
+      if (deployOutcome.message === 'cancelled') return;
 
-      const jobUrl = getJobPollUrl(
-        bulkResp,
-        state.org,
-        state.site,
-        state.ref,
-        topic,
-      );
-      if (!jobUrl) {
-        const urls = buildUrlsForPaths(
-          paths,
-          state.org,
-          state.site,
-          state.ref,
-          env,
-        );
-        state.status = topic === 'live'
-          ? `Bulk publish scheduled (${paths.length} paths).`
-          : `Bulk preview scheduled (${paths.length} paths).`;
-        state.statusType = 'success';
-        updateJobModal({
-          jobStartedAt: state.jobStartedAt,
-          processed: paths.length,
-          total: paths.length,
-          failed: 0,
-          stateLabel: 'complete',
-        });
-        await refreshPlatformStatusAfterJob(state, daFetch, paths, topic);
-        showJobCompleteModal({
-          summary: state.status,
-          topic,
-          urls,
-          host,
-          onClose: () => finishProgressModal(state),
-        });
-        return;
-      }
-
-      const finalJob = await pollJob(
-        daFetch,
-        jobUrl,
-        (job) => {
-          if (state.jobAbort?.signal.aborted) return;
-          const progress = job.progress || job.job?.progress;
-          if (progress && typeof progress === 'object') {
-            const { total, processed, failed } =
-              /** @type {{ total?: number, processed?: number, failed?: number }} */ (
-                progress
-              );
-            const proc = Number(processed ?? 0);
-            const tot = Number(total ?? paths.length);
-            state.jobProgressProcessed = proc;
-            state.jobProgressTotal = tot || paths.length;
-            updateJobModal({
-              jobStartedAt: state.jobStartedAt,
-              processed: proc,
-              total: tot || paths.length,
-              failed: Number(failed ?? 0),
-              stateLabel: String(job.state || job.job?.state || 'running'),
-            });
-          }
-        },
-        state.jobAbort?.signal,
-      );
-
-      if (state.jobAbort?.signal.aborted) return;
-
-      const outcome = resolveJobOutcome(finalJob);
-      state.status = `${action} ${outcome.message}`;
+      const { finalJob } = deployOutcome;
+      const outcome = {
+        statusType: deployOutcome.statusType,
+        message: deployOutcome.message,
+      };
+      const statusMessage = `${action} ${outcome.message}`;
       state.statusType = outcome.statusType;
+      state.status = outcome.statusType === 'error' ? statusMessage : null;
 
       let urls = [];
-      if (outcome.statusType === 'success') {
-        urls = buildUrlsForPaths(paths, state.org, state.site, state.ref, env);
+      if (outcome.statusType === 'success' || outcome.statusType === 'info') {
+        if (outcome.statusType === 'success') {
+          urls = buildUrlsForPaths(paths, state.org, state.site, state.ref, env);
+        }
         await refreshPlatformStatusAfterJob(state, daFetch, paths, topic);
       }
+
+      updateJobModal({
+        jobStartedAt: state.jobStartedAt,
+        processed: paths.length,
+        total: paths.length,
+        failed: 0,
+        stateLabel: 'complete',
+        phaseLabel: publishPhase,
+      });
 
       state.jobDetail = outcome.statusType === 'error'
         || new URLSearchParams(window.location.search).has('debug')
@@ -2915,14 +3119,17 @@ async function main() {
 
       if (outcome.statusType === 'error') {
         showJobErrorModal({
-          message: state.status,
+          message: statusMessage,
           topic,
-          hint: permissionErrorHint(0, state.status),
+          hint: permissionErrorHint(0, statusMessage),
           onClose: () => finishProgressModal(state),
         });
       } else {
+        const summary = previewFirst.length > 0 && topic === 'live'
+          ? `Published ${paths.length} page${paths.length === 1 ? '' : 's'} (${previewFirst.length} previewed first).`
+          : statusMessage;
         showJobCompleteModal({
-          summary: state.status,
+          summary,
           topic,
           urls,
           host,
@@ -3091,8 +3298,8 @@ async function main() {
       }
 
       const summary = notes.filter(Boolean).join('. ') || 'Operation finished.';
-      state.status = summary;
       state.statusType = statusType;
+      state.status = statusType === 'error' ? summary : null;
 
       updateJobModal({
         jobStartedAt: state.jobStartedAt,
@@ -3143,7 +3350,7 @@ async function main() {
   }
 
   state.contentLoading = true;
-  state.status = 'Fetching content…';
+  state.status = null;
   state.statusType = 'info';
   render(app, state);
   await state.onFetch(false);
@@ -3161,7 +3368,7 @@ function showBootError(err) {
     el(
       'p',
       'bulk-pp-boot-error-hint',
-      'Hard refresh (Cmd+Shift+R). If this persists, check the browser console for the failing module.',
+      'Hard refresh (Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows). If this persists, check the browser console for the failing module.',
     ),
   );
   app.append(panel);
